@@ -1,54 +1,85 @@
-# PathSnap – 11:30 checkpoint kit (preprocessing, features, model comparison)
+PathSnap: GPS map-matching and route reconstruction
+Team: Members: <name 1>, <name 2>, <name 3>, <name 4> Course: UE24CS352A Machine Learning, PES University (PathSnap Hackathon, 18-11-2026)
 
-Run from the repo root (put `Student folder/` next to `src/`, or pass its path):
+PathSnap takes noisy GPS points from a vehicle and works out which roads it actually drove on. A classifier scores candidate road segments for every GPS point, and an HMM with Viterbi decoding then joins those picks into a connected route. The result is served through a FastAPI backend and shown in a separate UI.
 
-```
+Status
+ Dataset exploration (EDA, Folium map)
+ Candidate generation and feature engineering
+ Six models trained and compared (trip-grouped CV + student-test)
+ Bayesian hyperparameter optimisation (XGBoost, Optuna)
+ HMM / Viterbi route reconstruction
+ FastAPI backend
+ Evaluator UI
+ Technical report (PDF)
+Setup
+Python 3.10+ is needed. Install the dependencies:
+
 pip install -r requirements.txt
-cd src
-python eda.py        "../Student folder"     # inventory, gaps, segments, plots, Folium map -> outputs/eda/
-python make_features.py "../Student folder"  # candidates + segmented features -> outputs/features.pkl
-python train_compare.py                       # 5 models, GroupKFold CV, student-test -> outputs/
-python train_xgb_optuna.py                    # candidate-classification XGBoost tuning
-python train_xgb_rank_optuna.py               # pairwise XGBoost ranking tuning; 100 TPE trials by default
-python run_xgb_pipeline.py                    # EDA + features + XGBoost optimization in one command
-```
-The evaluator partition is never read. Everything uses seed 42 and is logged to CSV/JSON.
+Put the dataset in a folder called Student folder/ next to the scripts. It should contain train/ and student_test/, each with one sub-folder per trip. The dataset is not in this repo. We never read the evaluator-testing partition during development.
 
-## 11:30 checklist (maps to the rubric: Preprocessing+FE = 5, Model selection+training = 5)
-- [ ] Run `eda.py`; open `dataset_inventory.csv` and read the anomaly table. Note what you find (gaps, NaNs, bad route ids, disconnected networks).
-- [ ] Check the Folium map: do the GPS points sit near the green route? If the route looks shifted, check coordinate order.
-- [ ] Run `make_features.py`; note the **candidate miss rate** and positive rate printed/stored.
-- [ ] Run `train_compare.py`; open `model_comparison.csv` and the PNGs.
-- [ ] Write 3-4 sentences each: why you chose the features, what the models show, which is selected and why
-      (primary metric: say whether it's CV macro F1, Top-1, or route continuity, and why).
-- [ ] Be ready to explain every line in viva.
+How to run
+Run these from the repo root, in this order:
 
-## Design decisions to be able to explain
-- **Projection**: local equirectangular (metres) around the network centre; degrees are not distances.
-- **Candidates**: for each GPS point, up to 10 nearest arcs within 150 m (nearest always kept), via exact point-to-segment distance.
-- **Label**: candidate arc is in the trip's `.route` set. The route is a sequence without per-point alignment,
-  so this is a proxy label (a route that revisits a road, or a parallel road, can blur it). State this limitation.
-- **Top-1 accuracy / miss rate**: correct if the top-scored candidate is in the route set; miss if no candidate is.
-- **Route continuity**: share of consecutive distinct predicted arcs where to_node(prev) == from_node(next).
-- **CV**: `GroupKFold` by trip, so no trip is split across folds. Scalers sit inside pipelines (fit on train folds only).
-- **Macro F1** uses a 0.5 threshold on candidate-level binary labels; positives are the minority class.
-- Loss curve is saved only for the MLP (the only model here with an epoch history).
+py eda.py                  # dataset inventory, anomalies, plots, Folium map  -> outputs/eda/
+py make_features.py        # candidates + features for train and student_test  -> outputs/features.pkl
+py train_compare.py        # trains and compares the models                    -> outputs/
+py diagnose_misses.py      # per-trip candidate miss analysis (optional)
+Each script writes live progress to outputs/dashboard.html. Open it in a browser while a script runs. train_compare.py uses the GPU for XGBoost if CUDA is available and falls back to the CPU otherwise.
 
-## Timestamp gaps and XGBoost optimization
-- Both EDA and feature generation split observations when consecutive timestamps differ by more than 120 seconds by default. Override with a second CLI argument, for example `python make_features.py "../Student folder" 60`.
-- Every observed fix remains in its original trip and keeps its observation index. No interpolation occurs. Previous/next-based features are clipped to each segment, and `dt_prev` is zero at each segment start.
-- Feature rows include a segment ID and cache metadata contains each segment's original observation ranges and lengths. CV groups by original trip, keeping all segments from a trip in one fold; route continuity is computed within segments.
-- `train_xgb_optuna.py` is the original candidate-classification tuning path. `train_xgb_rank_optuna.py` adds an XGBoost pairwise-ranking approach: candidates for each GPS observation form one ranking query, and Optuna maximizes pooled out-of-fold Top-1 under five-fold GroupKFold by original trip. It compares the ranker with the original XGBoost classifier baseline and selects using CV only; student-test labels are used only for the final development report. Ranking scores are not probabilities, so Macro F1 and Log Loss are reported only for the classifier. `PATHSNAP_OPTUNA_TRIALS` controls the ranker trial count (100 by default).
-- HMM/Viterbi is not implemented in this repository.
+What the code does
+Projection. Longitude/latitude are converted to metres with a local equirectangular projection centred on each trip's road network, so all distances are in metres and not degrees.
 
-### Simple run
-Install dependencies once, then run the full pipeline:
+Candidates. For each GPS point we take the 10 nearest road segments (K = 10) within 150 m, always keeping the nearest one. Distances are exact point-to-segment distances. For speed and memory, points are handled in chunks of 256 and each chunk is only compared against the arcs near it.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python run_xgb_pipeline.py
-```
+Label. A candidate is positive if its arc appears in the trip's .route file. The route is a sequence of arcs with no per-point alignment, so this is a proxy label. It can be wrong when a route revisits a road or when a parallel road is very close.
 
-To try more configurations, use `PATHSNAP_OPTUNA_TRIALS=100 python run_xgb_pipeline.py`. To use another data directory or threshold: `python run_xgb_pipeline.py "/path/to/Student folder" 120`. This does not rerun six-model selection. A 90% or 95% Top-1 score is a goal, not a guaranteed result; use the grouped-CV and student-test metrics in the generated comparison CSV to report what the run actually achieves.
+Features (16). Distance to the arc, position along the arc, arc length, distance rank, distance minus the nearest candidate's distance, distance ratio, number of candidates, heading agreement with the arc direction (signed and absolute), whether the heading is valid, speed, time since the previous point, distance of the previous and next GPS point to the same arc, and node degree at both arc ends.
+
+Cross-validation. GroupKFold with 5 folds, grouped by trip, so no trip is ever split between training and validation. Scalers are inside sklearn pipelines and fitted on the training fold only. Everything uses seed 42.
+
+Metrics.
+
+Macro F1 on candidate labels (threshold 0.5) and log loss.
+Observation-level Top-1: the highest-scored candidate for each GPS point is correct if its arc is in the reference route.
+Candidate miss rate: the share of GPS points where no candidate is in the reference route.
+Route continuity: among consecutive distinct predicted arcs, the share where the previous arc's end node is the next arc's start node.
+Training time and inference time.
+Model comparison (so far)
+CV is 5-fold grouped CV on the 80 training trips. Test is the 10 student-testing trips.
+
+Model	Family	CV macro F1	Test macro F1	Test Top-1	Test log loss	Test continuity	Train time
+Logistic Regression	Linear	0.757	0.760	0.862	0.526	0.550	1.5 s
+Gaussian Naive Bayes	Probabilistic	0.723	0.720	0.869	0.809	0.601	0.4 s
+XGBoost (GPU)	Boosting	0.807	0.787	0.885	0.523	0.557	3.4 s
+HistGradientBoosting	Boosting	0.808	0.786	0.887	0.512	0.593	24.6 s
+MLP (64, 32)	Neural network	0.817	0.792	0.881	0.528	0.446	184 s
+Random Forest	Ensemble	0.809	0.790	0.888	0.521	0.569	45 s
+The full numbers (fold-by-fold results, inference times, miss rates) are in outputs/model_comparison.csv and outputs/cv_fold_results.csv.
+
+Reading the table. The linear and Naive Bayes models are clearly behind. XGBoost, HistGradientBoosting, Random Forest and the MLP are within about 0.006 of each other on test F1, which is inside the noise with only 10 test trips. The MLP had the lowest route continuity in all five CV folds, so we dropped it. We picked XGBoost to take forward into tuning because it trains in a few seconds on the GPU, its probabilities are close to the best log loss, and its fold-to-fold spread is small. This choice is provisional until the tuning and HMM results are in.
+
+Known data issues
+Candidate misses. On the student-test trips only 0.07% of GPS points have no correct candidate, but a few training trips are much worse (trips 33 and 54 miss over half of their points). diagnose_misses.py shows two causes: on trips 33 and 54 the GPS sits a steady 120 to 140 m from the reference route (a systematic offset), and on trips such as 72 and 61 the correct arc exists but falls outside the 10 nearest candidates. This affects every model equally, so it does not change the ranking.
+Time gaps. One training trip has a gap of about 153,000 s between points, and the share of 1 s steps drops as low as 53% in some trips.
+Fragmented road networks. Several trips have dozens of disconnected components (up to 421), so the HMM will meet disconnected candidate pairs often.
+Reference routes are treated as reference information, not guaranteed ground truth.
+Repository layout
+common.py             projection, candidate generation, metrics
+eda.py                dataset exploration and the Folium map
+make_features.py      builds the candidate/feature tables
+train_compare.py      trains and compares the models
+diagnose_misses.py    candidate-miss analysis per trip
+telemetry.py          progress dashboard used by the scripts
+requirements.txt
+outputs/              results: CSVs, plots, config, Folium map, small saved models
+Large files (features.pkl, the bigger model files) are left out of the repo and can be regenerated by the scripts above.
+
+AI tool use
+We used Claude (Anthropic) as an assistant while building this project, for help with code and planning. Chat link for the TA:
+
+Results, metrics and plots in this repo come from our own runs of the code. We rewrote the explanations in our own words and every team member should be able to explain the code and results.
+
+Notes
+No credentials or API keys are stored in this repository.
+Evaluator ground truth is never part of the prediction pipeline or the UI.

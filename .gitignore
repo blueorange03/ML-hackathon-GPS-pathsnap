@@ -10,3 +10,4 @@ outputs/dashboard.html
 outputs/models/RandomForest.joblib
 outputs/models/HistGradientBoosting.joblib
 outputs/models/MLP.joblib
+*.pdf

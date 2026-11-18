@@ -1,0 +1,30 @@
+{
+  "seed": 42,
+  "features": [
+    "dist",
+    "frac",
+    "arc_len",
+    "rank",
+    "dist_minus_min",
+    "dist_ratio_min",
+    "n_cand",
+    "cos_diff",
+    "abs_cos",
+    "heading_valid",
+    "speed",
+    "dt_prev",
+    "dist_prev",
+    "dist_next",
+    "deg_from",
+    "deg_to"
+  ],
+  "models": {
+    "LogisticRegression": "C=1, scaled",
+    "GaussianNB": "default var_smoothing",
+    "XGBoost": "depth=6, lr=0.1, 300 trees, device=cuda",
+    "HistGradientBoosting": "lr=0.1, 200 iter",
+    "MLP": "(64,32), relu, early stop",
+    "RandomForest": "100 trees, min_leaf=10, max_samples=0.3"
+  },
+  "cv": "GroupKFold(5) by trip"
+}

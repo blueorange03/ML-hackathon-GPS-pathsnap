@@ -1,0 +1,12 @@
+
+hacka/
+.venv/
+__pycache__/
+*.pyc
+Student folder/
+outputs/features.pkl
+outputs/telemetry.json
+outputs/dashboard.html
+outputs/models/RandomForest.joblib
+outputs/models/HistGradientBoosting.joblib
+outputs/models/MLP.joblib

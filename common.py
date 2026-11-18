@@ -4,6 +4,7 @@ import numpy as np, pandas as pd
 
 EARTH_R = 6371000.0
 SEED = 42
+DEFAULT_GAP_THRESHOLD_S = 60.0
 
 
 def list_trips(split_dir):
@@ -27,6 +28,28 @@ def load_trip(split_dir, tid):
         arcs=_read(d / f"{tid}.arcs", 2, int).astype(int),  # from, to ; row idx = arc_id
         route=_read(d / f"{tid}.route", 1, int).astype(int).ravel(),
     )
+
+
+def segment_track(track, gap_threshold_s=DEFAULT_GAP_THRESHOLD_S):
+    """Return segment IDs and contiguous index ranges split at large timestamp gaps.
+
+    Every input observation is retained. The threshold applies to positive time
+    differences only; duplicate or decreasing timestamps remain in the segment.
+    """
+    track = np.asarray(track)
+    n = len(track)
+    if n == 0:
+        return np.zeros(0, dtype=int), []
+    if gap_threshold_s <= 0:
+        raise ValueError("gap_threshold_s must be positive")
+    dt = np.diff(track[:, 2])
+    cuts = np.flatnonzero(dt > gap_threshold_s) + 1
+    bounds = np.r_[0, cuts, n]
+    ranges = [(int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:])]
+    seg_id = np.empty(n, dtype=int)
+    for sid, (a, b) in enumerate(ranges):
+        seg_id[a:b] = sid
+    return seg_id, ranges
 
 
 class Projector:
@@ -63,7 +86,7 @@ FEATURES = ["dist", "frac", "arc_len", "rank", "dist_minus_min", "dist_ratio_min
             "dist_prev", "dist_next", "deg_from", "deg_to"]
 
 
-def build_candidates_slow(trip, K=10, radius=150.0):
+def build_candidates_slow(trip, K=10, radius=150.0, gap_threshold_s=DEFAULT_GAP_THRESHOLD_S):
     """One row per (GPS observation, candidate arc). Label = arc is in the reference route."""
     tr, nodes, arcs = trip["track"], trip["nodes"], trip["arcs"]
     if len(tr) < 2 or len(nodes) == 0 or len(arcs) == 0:
@@ -81,15 +104,22 @@ def build_candidates_slow(trip, K=10, radius=150.0):
     n, m = D.shape
     k = min(K, m)
     idx = np.argpartition(D, k - 1, axis=1)[:, :k]
-    # heading from neighbours (central difference), speed and dt
+    # Temporal features only use neighbours within the same segment.
+    seg_id, ranges = segment_track(tr, gap_threshold_s)
+    prv, nxt = np.arange(n), np.arange(n)
+    for a0, b0 in ranges:
+        ix = np.arange(a0, b0)
+        prv[ix] = np.maximum(ix - 1, a0)
+        nxt[ix] = np.minimum(ix + 1, b0 - 1)
     t = tr[:, 2]
-    prv, nxt = np.maximum(np.arange(n) - 1, 0), np.minimum(np.arange(n) + 1, n - 1)
     disp = P[nxt] - P[prv]
     dt_span = np.maximum(t[nxt] - t[prv], 1e-3)
     speed = np.linalg.norm(disp, axis=1) / dt_span
     heading = np.arctan2(disp[:, 1], disp[:, 0])
     hvalid = (np.linalg.norm(disp, axis=1) > 1.0).astype(float)
-    dt_prev = np.r_[0.0, np.diff(t)]
+    dt_prev = np.zeros(n)
+    for a0, b0 in ranges:
+        dt_prev[a0:b0] = np.r_[0.0, np.diff(t[a0:b0])]
 
     route_set = set(trip["route"].tolist())
     rows = []
@@ -104,11 +134,11 @@ def build_candidates_slow(trip, K=10, radius=150.0):
         dmin = d[0]
         for r, (a, dd) in enumerate(zip(cand, d)):
             cd = np.cos(heading[i] - arc_bear[a]) * hvalid[i]
-            rows.append((trip["tid"], i, a, int(a in route_set), dd, T[i, a], arc_len[a], r,
+            rows.append((trip["tid"], int(seg_id[i]), i, a, int(a in route_set), dd, T[i, a], arc_len[a], r,
                          dd - dmin, dd / (dmin + 1.0), len(cand), cd, abs(cd), hvalid[i],
                          speed[i], dt_prev[i], D[prv[i], a], D[nxt[i], a],
                          deg[arcs[a, 0]], deg[arcs[a, 1]]))
-    cols = ["trip", "obs", "arc_id", "label"] + FEATURES
+    cols = ["trip", "segment", "obs", "arc_id", "label"] + FEATURES
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -119,7 +149,7 @@ def _pair_dist(p, a, b):
     return np.linalg.norm(p - (a + t[:, None] * ab), axis=1), t
 
 
-def build_candidates(trip, K=10, radius=150.0, chunk=256):
+def build_candidates(trip, K=10, radius=150.0, chunk=256, gap_threshold_s=DEFAULT_GAP_THRESHOLD_S):
     """Memory-safe: GPS points are processed in chunks of `chunk`, each against only the arcs
     near that chunk, so no (n_obs x n_arcs) matrix is ever built."""
     tr, nodes, arcs = trip["track"], trip["nodes"], trip["arcs"]
@@ -179,12 +209,19 @@ def build_candidates(trip, K=10, radius=150.0, chunk=256):
     mask[:, 0] = True                                       # nearest always kept
 
     t = tr[:, 2]
-    prv, nxt = np.maximum(np.arange(n) - 1, 0), np.minimum(np.arange(n) + 1, n - 1)
+    seg_id, ranges = segment_track(tr, gap_threshold_s)
+    prv, nxt = np.arange(n), np.arange(n)
+    for a0, b0 in ranges:
+        ix = np.arange(a0, b0)
+        prv[ix] = np.maximum(ix - 1, a0)
+        nxt[ix] = np.minimum(ix + 1, b0 - 1)
     disp = P[nxt] - P[prv]
     speed = np.linalg.norm(disp, axis=1) / np.maximum(t[nxt] - t[prv], 1e-3)
     heading = np.arctan2(disp[:, 1], disp[:, 0])
     hvalid = (np.linalg.norm(disp, axis=1) > 1.0).astype(float)
-    dt_prev = np.r_[0.0, np.diff(t)]
+    dt_prev = np.zeros(n)
+    for a0, b0 in ranges:
+        dt_prev[a0:b0] = np.r_[0.0, np.diff(t[a0:b0])]
 
     i, c = np.nonzero(mask)
     a = AI[i, c]
@@ -197,7 +234,7 @@ def build_candidates(trip, K=10, radius=150.0, chunk=256):
     if len(r) and r.max() < M:
         route_set[r] = True
     return pd.DataFrame({
-        "trip": trip["tid"], "obs": i, "arc_id": a, "label": route_set[a].astype(int),
+        "trip": trip["tid"], "segment": seg_id[i], "obs": i, "arc_id": a, "label": route_set[a].astype(int),
         "dist": dist, "frac": TS[i, c], "arc_len": arc_len[a], "rank": c, "dist_minus_min": dist - dmin,
         "dist_ratio_min": dist / (dmin + 1.0), "n_cand": mask.sum(1)[i], "cos_diff": cd, "abs_cos": np.abs(cd),
         "heading_valid": hvalid[i], "speed": speed[i], "dt_prev": dt_prev[i],
@@ -214,16 +251,19 @@ def top1_and_miss(df, score):
 
 
 def predicted_arcs(df, score):
-    d = df[["trip", "obs", "arc_id"]].copy()
+    d = df[["trip", "segment", "obs", "arc_id"]].copy()
     d["score"] = score
-    return d.loc[d.groupby(["trip", "obs"])["score"].idxmax()].sort_values(["trip", "obs"])
+    return d.loc[d.groupby(["trip", "segment", "obs"])["score"].idxmax()].sort_values(["trip", "segment", "obs"])
 
 
 def route_continuity(pred, net):
     """Share of consecutive distinct predicted arcs that are topologically connected
     (to_node of previous == from_node of next). net = {trip: arcs array}."""
     ok = tot = 0
-    for trip, g in pred.groupby("trip"):
+    keys = ["trip", "segment"] if "segment" in pred.columns else ["trip"]
+    grouped = pred.groupby(keys)
+    for key, g in grouped:
+        trip = key[0] if isinstance(key, tuple) else key
         seq = g["arc_id"].values
         seq = seq[np.r_[True, seq[1:] != seq[:-1]]]
         arcs = net[trip]

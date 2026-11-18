@@ -9,6 +9,7 @@ from telemetry import Telemetry
 from tqdm import tqdm
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "Student folder")
+gap_threshold_s = float(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_GAP_THRESHOLD_S
 out = Path("outputs/eda"); out.mkdir(parents=True, exist_ok=True)
 rows, trips = [], {}
 tel = Telemetry()
@@ -23,6 +24,8 @@ for split in ["train", "student_test"]:           # evaluator partition is never
         lon_bad = int(((g[:, 0] < -180) | (g[:, 0] > 180)).sum()) if len(g) else 0
         lat_bad = int(((g[:, 1] < -90) | (g[:, 1] > 90)).sum()) if len(g) else 0
         dts = np.diff(t[:, 2]) if len(t) > 1 else np.array([])
+        gap_ids = np.flatnonzero(dts > gap_threshold_s)
+        seg_ids, seg_ranges = segment_track(t, gap_threshold_s)
         G = nx.Graph(); G.add_nodes_from(range(len(tr["nodes"])))
         G.add_edges_from(map(tuple, a)) if len(a) else None
         ncomp = nx.number_connected_components(G) if len(tr["nodes"]) else 0
@@ -35,17 +38,31 @@ for split in ["train", "student_test"]:           # evaluator partition is never
                          dup_ts=int((dts == 0).sum()), nonmonotonic_ts=int((dts < 0).sum()),
                          frac_dt_1s=float((dts == 1).mean()) if len(dts) else np.nan,
                          max_gap_s=float(dts.max()) if len(dts) else np.nan,
+                         large_gap_count=len(gap_ids), segment_count=len(seg_ranges),
+                         segment_lengths=";".join(str(b - a) for a, b in seg_ranges),
+                         large_gap_seconds=";".join(f"{dts[i]:.3f}" for i in gap_ids),
                          components=ncomp, isolated_nodes=iso, route_ids_valid=route_ok,
                          route_arc_connectivity=route_conn,
                          path_len_m=float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) if len(P) > 1 else 0,
                          lon_min=g[:, 0].min() if len(g) else np.nan, lon_max=g[:, 0].max() if len(g) else np.nan,
                          lat_min=g[:, 1].min() if len(g) else np.nan, lat_max=g[:, 1].max() if len(g) else np.nan))
 inv = pd.DataFrame(rows); inv.to_csv(out / "dataset_inventory.csv", index=False)
+gap_rows = []
+for split in ["train", "student_test"]:
+    for tid in list_trips(root / split):
+        t = trips[(split, tid)]["track"]
+        dts = np.diff(t[:, 2]) if len(t) > 1 else np.array([])
+        for ix in np.flatnonzero(dts > gap_threshold_s):
+            gap_rows.append(dict(split=split, trip=tid, obs_before=int(ix), obs_after=int(ix + 1),
+                                 gap_s=float(dts[ix])))
+pd.DataFrame(gap_rows, columns=["split", "trip", "obs_before", "obs_after", "gap_s"]).to_csv(
+    out / "large_gaps.csv", index=False)
 print(inv.groupby("split").agg(trips=("trip", "count"), obs_mean=("n_obs", "mean"), arcs_mean=("n_arcs", "mean"),
                                max_gap=("max_gap_s", "max"), nan=("nan_cells", "sum")).to_string())
-print("Trips with anomalies (gaps>5s, NaN, invalid route ids, >1 component):")
-print(inv[(inv.max_gap_s > 5) | (inv.nan_cells > 0) | (~inv.route_ids_valid) | (inv.components > 1)][
-    ["split", "trip", "max_gap_s", "nan_cells", "route_ids_valid", "components"]].to_string())
+print(f"Trips with gaps > {gap_threshold_s:g}s:")
+print(inv[inv.large_gap_count > 0][["split", "trip", "large_gap_count", "segment_count",
+                                    "segment_lengths", "large_gap_seconds"]].to_string(index=False))
+print(f"Gap threshold: {gap_threshold_s:g}s; gap report: {out / 'large_gaps.csv'}")
 
 # plots (partition = train)
 tr_inv = inv[inv.split == "train"]
